@@ -4,8 +4,11 @@
 
 """Defines a model wrapper for an openai model endpoint."""
 
+import asyncio
+import time
 import numpy as np
 import pandas as pd
+import nest_asyncio
 
 try:
     import openai
@@ -13,7 +16,8 @@ try:
 except ImportError:
     openai_installed = False
 try:
-    from openai import AzureOpenAI, OpenAI
+    from openai import (AzureOpenAI, OpenAI, OpenAIError,
+                        AsyncAzureOpenAI, AsyncOpenAI)
 except ImportError:
     # Ignore the error, only used by new openai version
     pass
@@ -79,6 +83,26 @@ class ChatCompletion(object):
         self.presence_penalty = presence_penalty
         self.stop = stop
         self.client = client
+
+    async def fetch_async(self, max_tries:int=4):
+        for i in range(max_tries):
+            try:
+                return await self.client.chat.completions.create(
+                    model=self.engine,
+                    messages=self.messages,
+                    temperature=self.temperature,
+                    max_tokens=self.max_tokens,
+                    top_p=self.top_p,
+                    frequency_penalty=self.frequency_penalty,
+                    presence_penalty=self.presence_penalty,
+                    stop=self.stop)
+            except OpenAIError as e:
+                if i == max_tries - 1:
+                    raise e
+                else:
+                    print(f'Caught exception: {e}')
+                    print(f'Retrying... ({i+1}/{max_tries})')
+                    await asyncio.sleep(5)
 
     def fetch(self):
         """Call the openai chat completion endpoint.
@@ -158,7 +182,26 @@ class OpenaiWrapperModel(object):
         self.stop = stop
         self.input_col = input_col
 
-    def _call_webservice(self, data, history=None, sys_prompt=None):
+    async def _call_webservice_async(self, client, data, history=None, sys_prompt=None):
+        fetchers = []
+        for i, doc in enumerate(data):
+            messages = []
+            if sys_prompt is not None:
+                messages.append({'role': 'system', CONTENT: sys_prompt[i]})
+            if history is not None:
+                messages.extend(history[i])
+            messages.append({'role': 'user', CONTENT: doc})
+            fetcher = ChatCompletion(messages, self.engine, self.temperature,
+                                    self.max_tokens, self.top_p,
+                                    self.frequency_penalty,
+                                    self.presence_penalty, self.stop, client)
+            fetchers.append(fetcher)
+        coroutines = [fetcher.fetch_async() for fetcher in fetchers]
+        results = await asyncio.gather(*coroutines, return_exceptions=True)
+        return results
+
+    def _call_webservice(self, data, history=None, sys_prompt=None,
+                         use_async:bool=None, max_rpm:int=None):
         """Common code to call the webservice.
 
         :param data: The data to send to the webservice.
@@ -181,37 +224,75 @@ class OpenaiWrapperModel(object):
                 data = data.tolist()
             else:
                 data = data.values.tolist()
-        client = None
-        if hasattr(openai, OPENAI):
+
+        use_async = False if use_async is None else use_async
+        max_rpm = 0 if max_rpm is None else max_rpm
+
+        if use_async and hasattr(openai, OPENAI):
+            nest_asyncio.apply()
             if self.api_type == AZURE:
-                client = AzureOpenAI(api_key=self.api_key, azure_endpoint=self.api_base,
-                                     api_version=self.api_version)
+                client = AsyncAzureOpenAI(
+                    api_key=self.api_key, azure_endpoint=self.api_base,
+                    api_version=self.api_version)
             else:
-                client = OpenAI(api_key=self.api_key)
+                client = AsyncOpenAI(api_key=self.api_key)
+
+            if max_rpm <=0:
+                print('No rate limit set, sending all requests at once')
+                results = asyncio.run(self._call_webservice_async(client, data))
+            else:
+                results = []
+                batches = [data[i:i + max_rpm] for i in range(0, len(data), max_rpm)]
+                for b in batches[:-1]:
+                    print(f'Sending batch of {len(b)} requests')
+                    t_start = time.time()
+                    batch_results = asyncio.run(self._call_webservice_async(client, b))
+                    results.extend(batch_results)
+                    t_end = time.time()
+                    sleep_time = max(0, 60 - (t_end - t_start)) + 1
+                    time.sleep(sleep_time)
+                batch_results = asyncio.run(self._call_webservice_async(client, batches[-1]))
+                results.extend(batch_results)
+
         else:
-            openai.api_key = self.api_key
-            openai.api_base = self.api_base
-            openai.api_type = self.api_type
-            openai.api_version = self.api_version
+            if hasattr(openai, OPENAI):
+                if self.api_type == AZURE:
+                    client = AzureOpenAI(
+                        api_key=self.api_key,
+                        azure_endpoint=self.api_base,
+                        api_version=self.api_version)
+                else:
+                    client = OpenAI(api_key=self.api_key)
+            else:
+                openai.api_key = self.api_key
+                openai.api_base = self.api_base
+                openai.api_type = self.api_type
+                openai.api_version = self.api_version
+                client = None
+
+            results = []
+            for i, doc in enumerate(data):
+                messages = []
+                if sys_prompt is not None:
+                    messages.append({'role': 'system', CONTENT: sys_prompt.iloc[i]})
+                if history is not None:
+                    messages.extend(history.iloc[i])
+                messages.append({'role': 'user', CONTENT: doc})
+                fetcher = ChatCompletion(messages, self.engine, self.temperature,
+                                            self.max_tokens, self.top_p,
+                                            self.frequency_penalty,
+                                            self.presence_penalty, self.stop, client)
+                action_name = "Call openai chat completion"
+                err_msg = "Failed to call openai endpoint"
+                max_retries = 4
+                retry_delay = 60
+                response = retry_function(fetcher.fetch, action_name, err_msg,
+                                            max_retries=max_retries,
+                                            retry_delay=retry_delay)
+                results.append(response)
+
         answers = []
-        for i, doc in enumerate(data):
-            messages = []
-            if sys_prompt is not None:
-                messages.append({'role': 'system', CONTENT: sys_prompt.iloc[i]})
-            if history is not None:
-                messages.extend(history.iloc[i])
-            messages.append({'role': 'user', CONTENT: doc})
-            fetcher = ChatCompletion(messages, self.engine, self.temperature,
-                                     self.max_tokens, self.top_p,
-                                     self.frequency_penalty,
-                                     self.presence_penalty, self.stop, client)
-            action_name = "Call openai chat completion"
-            err_msg = "Failed to call openai endpoint"
-            max_retries = 4
-            retry_delay = 60
-            response = retry_function(fetcher.fetch, action_name, err_msg,
-                                      max_retries=max_retries,
-                                      retry_delay=retry_delay)
+        for response in results:
             if isinstance(response, dict):
                 answers.append(replace_backtick_chars(response['choices'][0]['message'][CONTENT]))
             else:
@@ -272,5 +353,6 @@ class OpenaiWrapperModel(object):
         result = self._call_webservice(
             questions,
             history=history,
-            sys_prompt=sys_prompt)
+            sys_prompt=sys_prompt,
+            **kwargs)
         return result
