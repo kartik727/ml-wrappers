@@ -8,7 +8,11 @@ import asyncio
 import time
 import numpy as np
 import pandas as pd
-import nest_asyncio
+try:
+    import nest_asyncio
+    nest_asyncio_installed = True
+except ImportError:
+    nest_asyncio_installed = False
 
 try:
     import openai
@@ -18,9 +22,9 @@ except ImportError:
 try:
     from openai import (AzureOpenAI, OpenAI, OpenAIError,
                         AsyncAzureOpenAI, AsyncOpenAI)
+    is_openai_v1 = True
 except ImportError:
-    # Ignore the error, only used by new openai version
-    pass
+    is_openai_v1 = False
 try:
     from raiutils.common.retries import retry_function
     rai_utils_installed = True
@@ -110,10 +114,10 @@ class ChatCompletion(object):
         :return: The response.
         :rtype: dict
         """
-        if not hasattr(openai, OPENAI):
-            # openai<1.0.0
-            return openai.ChatCompletion.create(
-                engine=self.engine,
+
+        if is_openai_v1:
+            return self.client.chat.completions.create(
+                model=self.engine,
                 messages=self.messages,
                 temperature=self.temperature,
                 max_tokens=self.max_tokens,
@@ -123,9 +127,8 @@ class ChatCompletion(object):
                 stop=self.stop)
 
         else:
-            # openai>=1.0.0
-            return self.client.chat.completions.create(
-                model=self.engine,
+            return openai.ChatCompletion.create(
+                engine=self.engine,
                 messages=self.messages,
                 temperature=self.temperature,
                 max_tokens=self.max_tokens,
@@ -141,7 +144,7 @@ class OpenaiWrapperModel(object):
     def __init__(self, api_type, api_base, api_version, api_key,
                  engine="gpt-4-32k", temperature=0.7, max_tokens=800,
                  top_p=0.95, frequency_penalty=0, presence_penalty=0,
-                 stop=None, input_col='prompt'):
+                 stop=None, input_col='prompt', async_mode=False, max_req_per_min=0):
         """Initialize the model.
 
         :param api_type: The type of the API.
@@ -168,6 +171,10 @@ class OpenaiWrapperModel(object):
         :type stop: list
         :param input_col: The name of the input column.
         :type input_col: str
+        :param async_mode: Whether to use async mode.
+        :type async_mode: bool
+        :param max_req_per_min: Maximum requests per minute in async mode.
+        :type max_req_per_min: int
         """
         self.api_type = api_type
         self.api_base = api_base
@@ -181,6 +188,17 @@ class OpenaiWrapperModel(object):
         self.presence_penalty = presence_penalty
         self.stop = stop
         self.input_col = input_col
+        if async_mode:
+            self.async_mode = True
+            if not nest_asyncio_installed:
+                print('nest_asyncio package is required to use async mode. '
+                      'Falling back to sync mode.')
+                self.async_mode = False
+            if not is_openai_v1:
+                print('openai>=1.0.0 package is required to use async mode. '
+                      'Falling back to sync mode.')
+                self.async_mode = False
+        self.max_req_per_min = max_req_per_min
 
     async def _call_webservice_async(self, client, data, history=None, sys_prompt=None):
         fetchers = []
@@ -200,8 +218,7 @@ class OpenaiWrapperModel(object):
         results = await asyncio.gather(*coroutines, return_exceptions=True)
         return results
 
-    def _call_webservice(self, data, history=None, sys_prompt=None,
-                         use_async:bool=None, max_rpm:int=None):
+    def _call_webservice(self, data, history=None, sys_prompt=None):
         """Common code to call the webservice.
 
         :param data: The data to send to the webservice.
@@ -225,10 +242,7 @@ class OpenaiWrapperModel(object):
             else:
                 data = data.values.tolist()
 
-        use_async = False if use_async is None else use_async
-        max_rpm = 0 if max_rpm is None else max_rpm
-
-        if use_async and hasattr(openai, OPENAI):
+        if self.async_mode:
             nest_asyncio.apply()
             if self.api_type == AZURE:
                 client = AsyncAzureOpenAI(
@@ -237,12 +251,13 @@ class OpenaiWrapperModel(object):
             else:
                 client = AsyncOpenAI(api_key=self.api_key)
 
-            if max_rpm <=0:
+            if self.max_req_per_min <=0:
                 print('No rate limit set, sending all requests at once')
                 results = asyncio.run(self._call_webservice_async(client, data))
             else:
                 results = []
-                batches = [data[i:i + max_rpm] for i in range(0, len(data), max_rpm)]
+                batches = [data[i:i + self.max_req_per_min]
+                           for i in range(0, len(data), self.max_req_per_min)]
                 for b in batches[:-1]:
                     print(f'Sending batch of {len(b)} requests')
                     t_start = time.time()
@@ -255,7 +270,7 @@ class OpenaiWrapperModel(object):
                 results.extend(batch_results)
 
         else:
-            if hasattr(openai, OPENAI):
+            if is_openai_v1:
                 if self.api_type == AZURE:
                     client = AzureOpenAI(
                         api_key=self.api_key,
@@ -353,6 +368,5 @@ class OpenaiWrapperModel(object):
         result = self._call_webservice(
             questions,
             history=history,
-            sys_prompt=sys_prompt,
-            **kwargs)
+            sys_prompt=sys_prompt)
         return result

@@ -39,7 +39,8 @@ DEPENDENCIES = [
     'numpy',
     'pandas<2.0.0',
     'scipy',
-    'scikit-learn'
+    'scikit-learn',
+    'nest_asyncio'
 ]
 
 with open(README_FILE, 'r', encoding='utf-8') as f:
