@@ -198,6 +198,8 @@ class OpenaiWrapperModel(object):
                 print('openai>=1.0.0 package is required to use async mode. '
                       'Falling back to sync mode.')
                 self.async_mode = False
+        else:
+            self.async_mode = False
         self.max_req_per_min = max_req_per_min
 
     async def _call_webservice_async(self, client, data, history=None, sys_prompt=None):
